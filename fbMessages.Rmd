@@ -1,0 +1,324 @@
+---
+title: Exploring <Alice> and <Bob>’s Facebook Chat Messages within the Timeframe <start_date> - <end_date>
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+***
+
+**Introduction**
+
+***
+
+**Libraries**
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(plyr)
+library(tidyverse)
+library(rjson)
+library(purrr)
+library(lubridate)
+library(data.table)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(tm)
+library(urltools)
+```
+
+```{r seed}
+set.seed(2020)
+```
+
+***
+
+**Source Files**
+
+This version of the document assumes the message data was already acquired through the Facebook UI.
+
+```{r messagepath, echo=FALSE}
+# path to unzipped directory (named something like <BobSurname>_<RandomString>)
+messages_path <- "your_message_path"
+```
+
+```{r namesetter}
+sender1 <- "<Alice's Facebook screen name>"
+sender2 <- "<Bob's Facebook screen name>"
+```
+
+```{r loader}
+# concatenating the message files will take about a minute
+filenames <- list.files(messages_path, pattern = "^message", full.names = TRUE)
+messages <- filenames %>%
+  map(~fromJSON(file = .)$messages) %>%
+  unlist(recursive = FALSE) %>%
+  map(data.frame) %>%
+  rbind.fill()
+messages$timestamp_ms <- as.POSIXct(messages$timestamp_ms / 1000, tz="CET", origin="1970-01-01")
+messages$content <- as.character(messages$content)
+```
+
+***
+
+**Message Count**
+
+***Total count***
+```{r mcount}
+length(messages$content)
+```
+
+***Count per sender***
+```{r msender}
+messages %>%
+  group_by(sender_name) %>%
+  tally()
+```
+
+***Message count for each sender per month***
+```{r monthandyear}
+month_and_year <- function(timestamp) {
+  substr(timestamp, 0, 7)
+}
+```
+
+```{r bincount}
+bins <- messages %>%
+  group_by(month_and_year(timestamp_ms)) %>%
+  n_groups()
+```
+
+```{r mlongitudinal}
+ggplot(messages, aes(messages$timestamp_ms, fill=messages$sender_name)) +
+  geom_histogram(position="stack", bins=bins) +
+  labs(title = "Message Count per Month", x = "Month", y = "Message Count", fill = "Sender") +
+  theme(legend.position = "bottom")
+```
+
+***Message count grouped by hour of the day***
+
+```{r mtime}
+ggplot(messages, aes(hour(messages$timestamp_ms), fill=messages$sender_name)) +
+  geom_bar(position="dodge", width=0.8) +
+  labs(title = "Message Count per Hour", x = "Hour", y = "Message Count", fill = "Sender") +
+  theme(legend.position = "bottom")
+```
+
+***
+
+**Message Length**
+
+***Average length of messages per person***
+```{r mlength}
+messages$word_count <- messages$content %>%
+  as.character() %>%
+  strsplit(split = " ", fixed=TRUE) %>%
+  map(length) %>%
+  unlist
+
+messages %>%
+  group_by(sender_name) %>%
+  summarise(avg_length = mean(word_count))
+```
+
+***Message length in time***
+```{r mlengthlon}
+word_count_time <- messages %>%
+  group_by(month = month_and_year(timestamp_ms), sender_name) %>%
+  summarise(avg_word_count = mean(word_count))
+```
+
+```{r plotmlengthlon}
+ggplot(word_count_time, aes(x = month, y = avg_word_count, colour = sender_name)) +
+  geom_line(group = word_count_time$sender_name) +
+  labs(title = "Message Length per Month", x = "Month", y = "Average Message Length", colour = "Sender") +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+***
+
+**Word Frequency Analysis**
+
+The code in this section was largely adapted from the book [Text Mining with R](https://www.tidytextmining.com/tfidf.html).
+
+```{r freq}
+messages_words <- messages %>%
+  unnest_tokens(word, content) %>%
+  count(sender_name, word, sort = TRUE)
+
+total_words <- messages_words %>%
+  group_by(sender_name) %>%
+  summarise(total = sum(n))
+
+messages_words <- left_join(messages_words, total_words)
+messages_words
+```
+
+```{r mtfidf}
+messages_words <- messages_words %>%
+  bind_tf_idf(word, sender_name, n)
+
+messages_words %>%
+  select(-total) %>%
+  arrange(desc(tf_idf))
+```
+
+```{r mwordcloud}
+plot_wordcloud <- function(word_df, max_words) {
+  wordcloud(words = word_df$word, freq = word_df$tf_idf,
+  max.words=max_words, random.order=FALSE, rot.per=0.35,
+  colors=brewer.pal(8, "Dark2"))
+}
+```
+
+***<Alice>-specific words***
+
+```{r mwordcloud1}
+# suppresses warnings about words that are excluded due to lack of space
+suppressWarnings(messages_words %>%
+  filter(sender_name == sender1) %>%
+  drop_na(tf_idf) %>%
+  plot_wordcloud(max_words = 50))
+```
+
+***<Bob>-specific words***
+
+```{r mwordcloud2}
+suppressWarnings(messages_words %>%
+  filter(sender_name == sender2) %>%
+  drop_na(tf_idf) %>%
+  plot_wordcloud(max_words = 50))
+```
+
+It is likely necessary to perform more extensive data cleaning for all terms to make sense.
+
+***
+
+**Emoticon Usage**
+
+This tracks emoticons like ":)" (rather than emoji). As many people have their own emoticon-related idiosyncrasies (remember "xD"?), this is a rather flaky code chunk.
+
+The code in this section was largely adapted from the book [Text Mining with R](https://www.tidytextmining.com/tfidf.html).
+
+```{r memoticon}
+top_emoji <- messages %>%
+  select(sender_name, content) %>%
+  drop_na(content) %>%
+  # do not tokenize words, as they remove useful punctuation
+  separate_rows(content, sep = " ") %>%
+  separate_rows(content, sep = "\n") %>%
+  # filter out non-words
+  filter(grepl("\\W", content)) %>%
+  filter(!grepl("\\w[.,!?]", content)) %>%
+  filter(!grepl("\\w['/:-]\\w", content)) %>%
+  filter(!content %in% c(".", "?", "!", "...", "-", "*")) %>%
+  count(sender_name, content, sort = TRUE) %>%
+  group_by(sender_name) %>%
+  top_n(10, n) %>%
+  ungroup() %>%
+  arrange(sender_name, -n) %>%
+  mutate(content = reorder_within(content, n, sender_name))
+
+ggplot(top_emoji, aes(content, n, fill = sender_name)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sender_name, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Most Common Emoticons", x = "Emoticon", y = "Count")
+```
+
+***Usage of "<3"***
+```{r mhearts}
+hearts <- messages %>%
+  filter(grepl("<3", content, fixed = TRUE))
+
+bincount <- round(interval(min(hearts$timestamp_ms), max(hearts$timestamp_ms)) / months(1))
+ggplot(hearts, aes(hearts$timestamp_ms, fill=hearts$sender_name)) +
+  geom_histogram(position="dodge", bins=bincount) +
+  labs(title = "Heart Count per Month", x = "Month", y = "Heart Count", fill = "Sender") +
+  theme(legend.position = "bottom")
+```
+
+***
+
+**Shared Media**
+
+***Shared links***
+
+Number of shared links per person: 
+
+```{r lsender}
+messages$link <- domain(messages$link)
+
+messages %>%
+  drop_na(link) %>%
+  group_by(sender_name) %>%
+  tally()
+```
+
+Most commonly shared websites:
+
+```{r lcount}
+top_links <- messages %>%
+  drop_na(link) %>%
+  group_by(sender_name, link) %>%
+  tally(sort = TRUE) %>%
+  top_n(10, n) %>%
+  ungroup() %>%
+  arrange(sender_name, -n) %>%
+  mutate(link = reorder_within(link, n, sender_name))
+
+ggplot(top_links, aes(link, n, fill = sender_name)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sender_name, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme(axis.text.y = element_text(size=6)) +
+  labs(title = "Commonly Shared Websites", x = "Website", y = "Count")
+```
+
+***Shared photos***
+
+```{r psender}
+n <- keep(names(messages), ~grepl("^photos.uri", .))
+
+all_photos <- n %>%
+  map(~select(messages, sender_name, timestamp_ms, .)) %>%
+  map(drop_na) %>%
+  rbindlist(use.names = FALSE)
+
+all_photos %>%
+  group_by(sender_name) %>%
+  tally()
+```
+
+```{r pplotlon}
+ggplot(all_photos, aes(timestamp_ms, fill=sender_name)) +
+  geom_histogram(position="dodge", bins=bins) +
+  labs(title = "Photo Count per Month", x = "Month", y = "Photo Count", fill = "Sender") +
+  theme(legend.position = "bottom")
+```
+
+***Shared videos***
+
+```{r vsender}
+n <- keep(names(messages), ~grepl("^videos.uri", .))
+
+n %>%
+  map(~select(messages, sender_name, timestamp_ms, .)) %>%
+  map(drop_na) %>%
+  rbindlist(use.names = FALSE) %>%
+  group_by(sender_name) %>%
+  tally()
+```
+
+***Average call duration in seconds***
+
+```{r cavg}
+messages %>%
+  filter(type == "Call") %>%
+  filter(call_duration > 0) %>%
+  summarise(avg_call_duration_s = mean(call_duration))
+```
+
